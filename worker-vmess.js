@@ -1010,3 +1010,176 @@ function handleWebSocket(request, env) {
     // Return the WebSocket response
     return webSocket.response;
 }
+
+/**
+ * Converts a remote socket to a WebSocket connection using VMess protocol.
+ * @param {import("@cloudflare/workers-types").Socket} remoteSocket The remote socket to convert.
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocket The WebSocket to connect to.
+ * @param {ArrayBuffer | null} vmessResponseHeader The VMess response header.
+ * @param {(() => Promise<void>) | null} retry The function to retry the connection if it fails.
+ * @param {(info: string) => void} log The logging function.
+ * @returns {Promise<void>} A Promise that resolves when the conversion is complete.
+ */
+async function remoteSocketToWS(remoteSocket, webSocket, vmessResponseHeader, retry, log) {
+    // remote --> ws
+    let remoteChunkCount = 0;
+    let chunks = [];
+    /** @type {ArrayBuffer | null} */
+    let vmessHeader = vmessResponseHeader;
+    let hasIncomingData = false; // check if remoteSocket has incoming data
+    await remoteSocket.readable
+        .pipeTo(
+            new WritableStream({
+                start() {},
+                /**
+                 * @param {Uint8Array} chunk
+                 * @param {*} controller
+                 */
+                async write(chunk, controller) {
+                    hasIncomingData = true;
+                    remoteChunkCount++;
+                    if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+                        controller.error(
+                            'webSocket.readyState is not open, maybe closed'
+                        );
+                    }
+                    if (vmessHeader) {
+                        webSocket.send(await new Blob([vmessHeader, chunk]).arrayBuffer());
+                        vmessHeader = null;
+                    } else {
+                        console.log(`remoteSocketToWS send chunk ${chunk.byteLength}`);
+                        // If you want to rate limit, you can add a delay here
+                        // Example: await delay(1); // Delay for 1 millisecond
+                        webSocket.send(chunk);
+                    }
+                },
+                close() {
+                    log(`remoteConnection!.readable is closed with hasIncomingData is ${hasIncomingData}`);
+                    // safeCloseWebSocket(webSocket); // No need to close the WebSocket from the server first, as it may cause issues
+                },
+                abort(reason) {
+                    console.error(`remoteConnection!.readable abort`, reason);
+                },
+            })
+        )
+        .catch((error) => {
+            console.error(
+                `remoteSocketToWS has an exception `,
+                error.stack || error
+            );
+            safeCloseWebSocket(webSocket);
+        });
+
+    // Check if there was an error in the remoteSocket or if it didn't receive any data
+    if (!hasIncomingData && retry) {
+        log(`retry`);
+        retry();
+    }
+}
+
+/**
+ * Handles outbound UDP traffic by transforming the data into DNS queries and sending them over a WebSocket connection using VMess protocol.
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocket The WebSocket connection to send the DNS queries over.
+ * @param {ArrayBuffer} vmessResponseHeader The VMess response header.
+ * @param {(string) => void} log The logging function.
+ * @returns {{ write: (chunk: Uint8Array) => void }} An object with a write method that accepts a Uint8Array chunk to write to the transform stream.
+ */
+async function handleUDPOutBound(webSocket, vmessResponseHeader, log) {
+    let isVMessHeaderSent = false;
+    const transformStream = new TransformStream({
+        start(controller) {},
+        transform(chunk, controller) {
+            // UDP message format: 2 bytes for the length of UDP data followed by UDP data
+            for (let index = 0; index < chunk.byteLength;) {
+                const lengthBuffer = chunk.slice(index, index + 2);
+                const udpPacketLength = new DataView(lengthBuffer).getUint16(0);
+                const udpData = new Uint8Array(
+                    chunk.slice(index + 2, index + 2 + udpPacketLength)
+                );
+                index = index + 2 + udpPacketLength;
+                controller.enqueue(udpData);
+            }
+        },
+        flush(controller) {},
+    });
+
+    // Handle DNS queries and send them over the WebSocket
+    transformStream.readable.pipeTo(
+        new WritableStream({
+            async write(chunk) {
+                const resp = await fetch(dohURL, {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/dns-message',
+                    },
+                    body: chunk,
+                });
+                const dnsQueryResult = await resp.arrayBuffer();
+                const udpSize = dnsQueryResult.byteLength;
+                const udpSizeBuffer = new Uint8Array([
+                    (udpSize >> 8) & 0xff,
+                    udpSize & 0xff,
+                ]);
+                if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                    log(`DNS UDP success, message length is ${udpSize}`);
+                    if (isVMessHeaderSent) {
+                        webSocket.send(
+                            await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer()
+                        );
+                    } else {
+                        webSocket.send(
+                            await new Blob([vmessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer()
+                        );
+                        isVMessHeaderSent = true;
+                    }
+                }
+            },
+        })
+    ).catch((error) => {
+        log('DNS UDP error: ' + error);
+    });
+
+    const writer = transformStream.writable.getWriter();
+
+    return {
+        /**
+         * @param {Uint8Array} chunk
+         */
+        write(chunk) {
+            writer.write(chunk);
+        },
+    };
+}
+
+/**
+ * Generates VMess configuration for multiple users.
+ * @param {string} userIDs - Single or comma-separated user IDs.
+ * @param {string | null} hostName - The hostname or domain name.
+ * @returns {string} The VMess configuration.
+ */
+function generateVMessConfig(userIDs, hostName) {
+    const commonURLPart = `:${vmessPort}?security=auto&host=${hostName}`;
+    const separator = "---------------------------------------------------------------";
+
+    // Split the userIDs into an array
+    const userIDArray = userIDs.split(',');
+
+    // Prepare the output array
+    const output = [];
+
+    // Generate VMess configuration for each user
+    userIDArray.forEach((userID) => {
+        const vmessURL = `vmess://${userID}${commonURLPart}`;
+        output.push(`User ID: ${userID}`);
+        output.push(`${separator}\n${vmessURL}\n${separator}`);
+    });
+
+    return output.join('\n');
+}
+
+// Example usage:
+const userIDs = "your-user-ids"; // Replace with your user IDs
+const hostName = "your-hostname"; // Replace with your hostname or domain name
+const vmessPort = 443; // Replace with your VMess port
+const vmessConfig = generateVMessConfig(userIDs, hostName);
+console.log(vmessConfig); // Output the generated VMess configuration
